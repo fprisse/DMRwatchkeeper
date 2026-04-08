@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dmr_monitor VERSION 0.3.0 LANGUAGES CXX)
+project(dmr_monitor VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -30,6 +30,9 @@ set(SOURCES
     # Phase 3
     src/burst_sync.cpp
     src/slot_manager.cpp
+    # Phase 4
+    src/bptc19696.cpp
+    src/lc_parser.cpp
 )
 
 add_executable(dmr_monitor ${SOURCES})
