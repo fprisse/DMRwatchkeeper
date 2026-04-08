@@ -1,8 +1,10 @@
 #pragma once
 
+#include "burst_sync.h"
 #include "channel_filter.h"
 #include "fm_discriminator.h"
 #include "fsk_slicer.h"
+#include "slot_manager.h"
 #include "timing_recovery.h"
 
 #include <cstdint>
@@ -12,69 +14,69 @@
 /*
  * DemodChain
  *
- * Complete demodulation pipeline for one DMR channel.
+ * Complete demodulation + framing pipeline for one DMR channel.
  *
  *   raw IQ bytes (uint8_t, 250 kSPS)
- *       │
- *       ▼  ChannelFilter
- *   complex<float> at 25 kSPS  (frequency-shifted, LPF, decimated)
- *       │
- *       ▼  FmDiscriminator
- *   float (instantaneous frequency proxy) at 25 kSPS
- *       │
- *       ▼  TimingRecovery  (Gardner TED + PI loop filter)
- *   float symbol value at 4800 symbols/sec
- *       │
- *       ▼  FskSlicer  (adaptive 4-level decision)
- *   uint8_t dibit  (0=00, 1=01, 2=10, 3=11)
- *       │
- *       ▼  DibitCallback  ← Phase 3 burst sync will attach here
- *
- * All processing is synchronous — call process() from the channelizer thread.
- * No internal threads.
+ *       |
+ *       v  ChannelFilter
+ *   complex<float> at 25 kSPS
+ *       |
+ *       v  FmDiscriminator
+ *   float frequency proxy at 25 kSPS
+ *       |
+ *       v  TimingRecovery (Gardner TED)
+ *   float symbol at 4800 sym/s
+ *       |
+ *       v  FskSlicer
+ *   uint8_t dibit (0-3)
+ *       |
+ *       v  BurstSync                          <-- Phase 3 addition
+ *   BurstSync::Burst (98 payload dibits)
+ *       |
+ *       v  SlotManager (TS1 / TS2 state)      <-- Phase 3 addition
+ *   SlotManager::SlotEvent
+ *       |
+ *       v  Layer2Callback  <-- Phase 4 will attach BPTC + LC + GPS parser
  */
 class DemodChain {
 public:
-    // Called for every recovered dibit.
-    // Phase 3 will replace this with the burst sync detector.
-    using DibitCallback = std::function<void(uint8_t dibit, int channel_idx)>;
+    // Layer 2 callback: invoked for every assembled, slot-assigned burst.
+    // Phase 4 replaces the lambda body with BPTC decoder + LC parser.
+    using Layer2Callback = SlotManager::Layer2Callback;
 
     struct Config {
-        float   channel_freq_hz;             // absolute channel frequency (Hz)
-        float   centre_freq_hz = 446'099'000.0f;
-        int     channel_idx    = 0;          // identifier passed through to callback
-        std::string label;                   // e.g. "446.006"
+        float       channel_freq_hz;
+        float       centre_freq_hz = 446099000.0f;
+        int         channel_idx    = 0;
+        std::string label;
 
         ChannelFilter::Config  filter{};
         TimingRecovery::Config timing{};
         FskSlicer::Config      slicer{};
     };
 
-    explicit DemodChain(const Config& cfg, DibitCallback cb);
+    explicit DemodChain(const Config& cfg, Layer2Callback cb);
 
-    /*
-     * process()
-     * Feed a block of raw IQ bytes. Drives the complete pipeline.
-     * num_pairs = bytes / 2.
-     */
     void process(const uint8_t* raw_iq, size_t num_pairs);
 
     // Diagnostics
-    uint64_t symbols_recovered() const { return timing_.symbol_count(); }
-    float    timing_omega()      const { return timing_.omega(); }
-    float    slicer_outer()      const { return slicer_.outer_level(); }
-    const std::string& label()   const { return cfg_.label; }
+    uint64_t symbols_recovered()    const { return timing_.symbol_count(); }
+    uint64_t bursts_detected()      const { return burst_sync_.bursts_detected(); }
+    float    timing_omega()         const { return timing_.omega(); }
+    float    slicer_outer()         const { return slicer_.outer_level(); }
+    SlotManager::SlotState slot_state(int ts) const { return slot_mgr_.slot_state(ts); }
+    const std::string& label()      const { return cfg_.label; }
 
 private:
-    Config          cfg_;
-    DibitCallback   dibit_cb_;
+    Config           cfg_;
 
-    ChannelFilter   filter_;
-    FmDiscriminator disc_;
-    TimingRecovery  timing_;
-    FskSlicer       slicer_;
+    ChannelFilter    filter_;
+    FmDiscriminator  disc_;
+    TimingRecovery   timing_;
+    FskSlicer        slicer_;
+    BurstSync        burst_sync_;
+    SlotManager      slot_mgr_;
 
-    // Scratch buffers — reused across process() calls to avoid allocations
     std::vector<std::complex<float>> iq_buf_;
     std::vector<float>               disc_buf_;
 };
