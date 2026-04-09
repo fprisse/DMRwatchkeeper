@@ -35,10 +35,24 @@ void Capture::start() {
 
     rtlsdr_dev_t* dev = nullptr;
 
-    // Open device
-    if (rtlsdr_open(&dev, cfg_.device_index) < 0) {
+    // Open device — resolve by serial if configured, otherwise use index
+    uint32_t open_index = cfg_.device_index;
+    if (!cfg_.serial.empty()) {
+        const int idx = rtlsdr_get_index_by_serial(cfg_.serial.c_str());
+        if (idx < 0) {
+            throw std::runtime_error(
+                "Capture: no RTL-SDR device with serial '"
+                + cfg_.serial + "' found. "
+                + "Check the dongle is connected and the serial was set with: "
+                + "rtl_eeprom -d 0 -s " + cfg_.serial);
+        }
+        open_index = static_cast<uint32_t>(idx);
+        fprintf(stderr, "[capture] serial '%s' resolved to device index %u\n",
+                cfg_.serial.c_str(), open_index);
+    }
+    if (rtlsdr_open(&dev, open_index) < 0) {
         throw std::runtime_error("Capture: failed to open RTL-SDR device index "
-                                  + std::to_string(cfg_.device_index));
+                                  + std::to_string(open_index));
     }
     dev_ = dev;
 

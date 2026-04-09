@@ -4,6 +4,7 @@
 #include "demod_chain.h"
 #include "lc_parser.h"
 #include "slot_manager.h"
+#include "udp_output.h"
 
 #include <atomic>
 #include <chrono>
@@ -17,32 +18,38 @@
 #include <vector>
 
 /*
- * dmr_monitor -- Phase 4
+ * dmr_monitor -- Phase 5
  *
- * Adds BPTC(196,96) decoding, LC parsing, and GPS extraction.
+ * Adds UDP output to Node-RED (or any UDP listener).
  *
- * Output (JSON Lines to stdout, one object per event):
+ * Every JSON event is sent as a single UDP datagram to UDP_HOST:UDP_PORT
+ * in addition to being written to stdout.
  *
- * Voice call:
- *   {"ts":"...","ch":"446.006","slot":1,"type":"voice",
- *    "src":1234567,"dst":9001,"group":true}
+ * Node-RED setup:
+ *   [udp in] port=41414, output="a String"
+ *   → [json]
+ *   → your flow
  *
- * GPS report:
- *   {"ts":"...","ch":"446.006","slot":2,"type":"gps",
- *    "src":1234567,"lat":52.3731,"lon":4.8922}
- *
- * Unknown / undecoded burst:
- *   {"ts":"...","ch":"446.006","slot":1,"type":"burst",
- *    "burst_type":"BS_DATA","state":"DATA"}
+ * To change destination, edit UDP_HOST and UDP_PORT below and rebuild.
  */
+
+// ── UDP destination ───────────────────────────────────────────────────────────
+
+static constexpr const char*  UDP_HOST = "127.0.0.1";  // Node-RED host
+static constexpr uint16_t     UDP_PORT = 41414;         // Node-RED UDP in port
+
+// ── Globals ───────────────────────────────────────────────────────────────────
 
 static std::atomic<bool> g_running{true};
 static void signal_handler(int) {
     g_running.store(false, std::memory_order_release);
 }
 
-// Mutex to serialise stdout writes from all channel callbacks
-static std::mutex g_stdout_mtx;
+// Serialises stdout writes and UDP sends from all channel callbacks
+static std::mutex    g_output_mtx;
+static UdpOutput*    g_udp = nullptr;   // set in main() before threads start
+
+// ── Channel table ─────────────────────────────────────────────────────────────
 
 struct ChannelDef { float freq_hz; const char* label; };
 
@@ -58,6 +65,8 @@ static const ChannelDef CHANNELS[] = {
 };
 static constexpr int NUM_CHANNELS = (int)(sizeof(CHANNELS) / sizeof(CHANNELS[0]));
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
 static void iso8601(char* buf26) {
     time_t t = time(nullptr);
     struct tm tm;
@@ -65,79 +74,77 @@ static void iso8601(char* buf26) {
     strftime(buf26, 26, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
-// ── Layer 2 callback: runs for every assembled burst ─────────────────────────
-// One instance per channel (captures channel label by value).
+// Emit one JSON event: write to stdout AND send via UDP
+static void emit(const char* json) {
+    std::lock_guard<std::mutex> lk(g_output_mtx);
+
+    // stdout (for systemd journal / file redirect)
+    puts(json);
+    fflush(stdout);
+
+    // UDP (for Node-RED)
+    if (g_udp && g_udp->is_open()) {
+        g_udp->send(json);
+    }
+}
+
+// ── Layer 2 callback ──────────────────────────────────────────────────────────
 
 static SlotManager::Layer2Callback make_layer2_cb(const char* ch_label) {
-
     return [ch_label](const SlotManager::SlotEvent& ev) {
 
         const BurstSync::Burst& burst = ev.burst;
 
-        // Decode BPTC
         BPTC19696 bptc;
         uint8_t lc_bits[96];
-        const bool bptc_ok = bptc.decode(burst.dibits, lc_bits);
-
-        if (!bptc_ok) {
-            // Uncorrectable error — skip this burst silently.
-            // Increase verbosity here if you want to log FEC failures.
-            return;
-        }
+        if (!bptc.decode(burst.dibits, lc_bits)) return;
 
         char ts[26];
         iso8601(ts);
+        char json[320];
 
         using BT = BurstSync::BurstType;
 
-        // ── Voice burst → parse LC for Source/Dest IDs ────────────────────
+        // ── Voice burst ───────────────────────────────────────────────────
         if (burst.type == BT::BS_VOICE || burst.type == BT::MS_VOICE) {
             const LcResult lc = LcParser::parse_voice_lc(lc_bits);
             if (!lc.valid) return;
 
-            std::lock_guard<std::mutex> lk(g_stdout_mtx);
-            printf("{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
-                   "\"type\":\"voice\","
-                   "\"src\":%u,\"dst\":%u,\"group\":%s}\n",
-                   ts, ch_label, burst.timeslot,
-                   lc.src_id, lc.dst_id,
-                   lc.group ? "true" : "false");
-            fflush(stdout);
+            snprintf(json, sizeof(json),
+                "{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
+                "\"type\":\"voice\","
+                "\"src\":%u,\"dst\":%u,\"group\":%s}",
+                ts, ch_label, burst.timeslot,
+                lc.src_id, lc.dst_id,
+                lc.group ? "true" : "false");
+            emit(json);
             return;
         }
 
-        // ── Data burst → attempt GPS parse ────────────────────────────────
+        // ── Data burst — attempt GPS parse ────────────────────────────────
         if (burst.type == BT::BS_DATA || burst.type == BT::MS_DATA) {
             const GpsResult gps = LcParser::parse_gps(lc_bits);
             if (gps.valid) {
-                std::lock_guard<std::mutex> lk(g_stdout_mtx);
-                // For data bursts we don't have a Source ID at this layer
-                // without a full data header decode (Phase 5 extension).
-                // We print the coordinates and mark src as 0.
-                printf("{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
-                       "\"type\":\"gps\","
-                       "\"src\":0,\"lat\":%.6f,\"lon\":%.6f}\n",
-                       ts, ch_label, burst.timeslot,
-                       gps.lat, gps.lon);
-                fflush(stdout);
-                return;
+                snprintf(json, sizeof(json),
+                    "{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
+                    "\"type\":\"gps\","
+                    "\"src\":0,\"lat\":%.6f,\"lon\":%.6f}",
+                    ts, ch_label, burst.timeslot,
+                    gps.lat, gps.lon);
+                emit(json);
             }
-            // Non-GPS data burst: fall through to generic output below
         }
 
-        // ── Generic burst event (no decoded payload) ───────────────────────
-        // Uncomment if you want to log every burst, not just decoded ones.
+        // Uncomment to emit every burst (including undecoded):
         /*
-        {
-            std::lock_guard<std::mutex> lk(g_stdout_mtx);
-            printf("{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
-                   "\"type\":\"burst\","
-                   "\"burst_type\":\"%s\",\"state\":\"%s\"}\n",
-                   ts, ch_label, burst.timeslot,
-                   BurstSync::burst_type_str(burst.type),
-                   SlotManager::state_str(ev.state));
-            fflush(stdout);
-        }
+        snprintf(json, sizeof(json),
+            "{\"ts\":\"%s\",\"ch\":\"%s\",\"slot\":%d,"
+            "\"type\":\"burst\","
+            "\"burst_type\":\"%s\",\"state\":\"%s\"}",
+            ts, ch_label, burst.timeslot,
+            BurstSync::burst_type_str(burst.type),
+            SlotManager::state_str(ev.state));
+        emit(json);
         */
     };
 }
@@ -169,14 +176,31 @@ int main(int, char*[]) {
     std::signal(SIGINT,  signal_handler);
     std::signal(SIGTERM, signal_handler);
 
+    // ── UDP output ────────────────────────────────────────────────────────
+    UdpOutput udp(UDP_HOST, UDP_PORT);
+    g_udp = &udp;
+    try {
+        udp.open();
+    } catch (const std::exception& e) {
+        // Non-fatal: log the error and continue without UDP.
+        // stdout output still works normally.
+        fprintf(stderr, "[main] warning: UDP init failed: %s\n", e.what());
+        fprintf(stderr, "[main] continuing with stdout only\n");
+    }
+
+    // ── Capture config ────────────────────────────────────────────────────
     CaptureConfig cap_cfg;
-    cap_cfg.device_index  = 0;
+    cap_cfg.device_index  = 0;           // fallback if serial not set or not found
+    cap_cfg.serial        = "";          // set to e.g. "dmr_monitor" if you have a
+                                         // KrakenSDR or multiple dongles — see §18
+                                         // of the build manual
     cap_cfg.centre_freq   = 446099000;
     cap_cfg.sample_rate   = 250000;
     cap_cfg.gain_db       = 30;
     cap_cfg.auto_gain     = false;
     cap_cfg.ring_capacity = 4 * 1024 * 1024;
 
+    // ── Build channel demod chains ────────────────────────────────────────
     std::vector<std::unique_ptr<DemodChain>> chains;
     chains.reserve(NUM_CHANNELS);
 
@@ -186,23 +210,29 @@ int main(int, char*[]) {
         dc.centre_freq_hz  = (float)cap_cfg.centre_freq;
         dc.channel_idx     = i;
         dc.label           = CHANNELS[i].label;
-
         chains.push_back(std::make_unique<DemodChain>(
             dc, make_layer2_cb(CHANNELS[i].label)));
     }
 
+    // ── Start capture ─────────────────────────────────────────────────────
     Capture cap(cap_cfg);
     try { cap.start(); }
     catch (const std::exception& e) {
         fprintf(stderr, "[main] fatal: %s\n", e.what());
+        udp.close();
         return EXIT_FAILURE;
     }
 
     std::thread chann_thread(channelizer_thread, &cap, &chains);
 
-    fprintf(stderr, "[dmr_monitor] Phase 4 running -- JSON to stdout, Ctrl-C to stop\n\n");
+    fprintf(stderr,
+        "[dmr_monitor] running\n"
+        "  JSON  -> stdout\n"
+        "  JSON  -> UDP %s:%u\n"
+        "  Press Ctrl-C to stop\n\n",
+        UDP_HOST, UDP_PORT);
 
-    // Status: print burst/symbol counts every 10 seconds to stderr
+    // ── Status loop ───────────────────────────────────────────────────────
     int tick = 0;
     std::vector<uint64_t> prev_bursts(NUM_CHANNELS, 0);
 
@@ -223,13 +253,15 @@ int main(int, char*[]) {
                         SlotManager::state_str(chains[i]->slot_state(2)));
             }
         }
-        fprintf(stderr, "  RTL: %.1f MB  overruns: %llu\n\n",
+        fprintf(stderr, "  RTL: %.1f MB  overruns: %llu  UDP: %s\n\n",
                 cap.bytes_captured() / 1e6,
-                (unsigned long long)cap.ring().overrun_count());
+                (unsigned long long)cap.ring().overrun_count(),
+                udp.is_open() ? "ok" : "closed");
     }
 
     fprintf(stderr, "\n[main] shutting down...\n");
     if (chann_thread.joinable()) chann_thread.join();
     cap.stop();
+    udp.close();
     return EXIT_SUCCESS;
 }

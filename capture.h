@@ -22,7 +22,12 @@
  * baseband streams at 12.5 kHz each.
  */
 struct CaptureConfig {
-    uint32_t    device_index  = 0;              // RTL-SDR USB device index
+    uint32_t    device_index  = 0;              // RTL-SDR USB device index (fallback)
+    std::string serial        = "";             // Serial string — if non-empty, overrides
+                                                // device_index. Set with:
+                                                //   rtl_eeprom -d 0 -s dmr_monitor
+                                                // Recommended when running alongside a
+                                                // KrakenSDR or multiple RTL-SDR devices.
     uint32_t    centre_freq   = 446'099'000;    // Hz  (446.099 MHz)
     uint32_t    sample_rate   = 250'000;        // S/s (250 kSPS)
     int         gain_db       = 30;             // tenths of dB in librtlsdr
